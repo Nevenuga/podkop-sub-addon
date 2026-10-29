@@ -1,9 +1,16 @@
 'use strict';
 'require view';
 'require form';
-'require uci';
+'require rpc';
 'require fs';
 'require ui';
+
+var callCommit = rpc.declare({
+  object: 'uci',
+  method: 'commit',
+  params: [ 'config' ],
+  reject: true
+});
 
 return view.extend({
   render: function () {
@@ -62,16 +69,27 @@ return view.extend({
     o.inputtitle = _('Загрузить');
     o.inputstyle = 'apply';
     o.onclick = ui.createHandlerFn(this, function () {
-      // Save and commit first: the CLI reads the committed UCI file,
-      // so an unsaved URL would silently fetch the previous one.
+      // Save stages the form values in the LuCI session; the CLI reads the
+      // committed file, so the changes must reach /etc/config before it runs.
+      // uci/apply is deliberately not used: its rollback machinery rejects
+      // an apply with nothing staged (and one racing a pending rollback)
+      // with ubus code 5, which used to kill the whole chain before the CLI
+      // was ever invoked. A plain uci/commit of our own config only is a
+      // no-op when nothing changed and still fires the config-change event
+      // the cron trigger listens on.
       // The CLI speaks English on purpose - its output goes to syslog too.
       return m.save()
-        .then(function () { return uci.apply(); })
+        .then(function () { return callCommit('podkop-sub'); })
         .then(function () { return fs.exec('/usr/bin/podkop-sub', ['update']); })
         .then(function (res) {
           var out = ((res.stdout || '') + (res.stderr || '')).trim();
           ui.addNotification(null, E('pre', {}, out || _('Нет вывода')),
             res.code === 0 ? 'info' : 'error');
+        })
+        .catch(function (e) {
+          ui.addNotification(null,
+            E('pre', {}, _('Ошибка: ') + (e && e.message ? e.message : e)),
+            'error');
         });
     });
 
