@@ -1,0 +1,346 @@
+#!/bin/sh
+# podkop-sub - fetch a subscription URL and feed its servers into podkop
+
+. /lib/functions.sh
+
+CONF=podkop-sub
+UA="podkop-sub/0.3"
+
+log() { logger -t podkop-sub "$1"; echo "$1"; }
+err() { logger -t podkop-sub -p user.err "$1"; echo "$1" >&2; }
+
+# Hide the token before anything reaches a log or the UI
+mask_url() {
+  echo "$1" | sed -E 's#(://[^/]*/).*#\1<masked>#'
+}
+
+# Subscriptions come base64'd with the URL-safe alphabet as often as the
+# standard one, and padding is routinely stripped. Put both back.
+b64_decode() {
+  local data
+  data=$(tr -d '\n\r \t' | tr -- '-_' '+/')
+  case $((${#data} % 4)) in
+    2) data="$data==" ;;
+    3) data="$data=" ;;
+  esac
+  printf '%s' "$data" | base64 -d 2>/dev/null
+}
+
+nlines() { printf '%s' "$1" | grep -c . ; }
+
+# Ban list set in LuCI: words and characters that keep a server out of the
+# pool. Matching happens on the server name only - the part after '#'. Names
+# in a subscription are stored percent-encoded (Cyrillic as %D0.., emoji as
+# %F0..), so the name is decoded before comparing. A word matches anywhere
+# in the name, case-insensitive including Cyrillic; every character of
+# FILTER_CHARS bans on its own. A link without a name has nothing to judge,
+# so it is kept.
+FILTER_WORDS=
+collect_word() {
+  FILTER_WORDS="$FILTER_WORDS$1
+"
+}
+
+# Values go in through ENVIRON rather than -v: awk escape-processes its -v
+# arguments, so a backslash typed by the user would corrupt the list.
+apply_filter() {
+  FILTER_WORDS="$FILTER_WORDS" FILTER_CHARS="$FILTER_CHARS" awk '
+    function hexval(c) { return index("0123456789abcdef", tolower(c)) - 1 }
+
+    # %XX back to raw bytes. busybox sprintf("%c", n) emits exactly one byte,
+    # so a UTF-8 sequence reassembled byte by byte stays intact.
+    function urldecode(s,   out, p, h1, h2) {
+      out = ""
+      while ((p = index(s, "%")) > 0) {
+        out = out substr(s, 1, p - 1)
+        s = substr(s, p + 1)
+        h1 = toupper(substr(s, 1, 1)); h2 = toupper(substr(s, 2, 1))
+        if (index("0123456789ABCDEF", h1) > 0 &&
+            index("0123456789ABCDEF", h2) > 0) {
+          out = out sprintf("%c", hexval(h1) * 16 + hexval(h2))
+          s = substr(s, 3)
+        } else {
+          out = out "%"
+        }
+      }
+      return out s
+    }
+
+    # tolower() only knows ASCII; Cyrillic goes through explicit pairs
+    function lowcase(s) {
+      s = tolower(s)
+      gsub(/Ё/, "ё", s)
+      gsub(/А/, "а", s)
+      gsub(/Б/, "б", s)
+      gsub(/В/, "в", s)
+      gsub(/Г/, "г", s)
+      gsub(/Д/, "д", s)
+      gsub(/Е/, "е", s)
+      gsub(/Ж/, "ж", s)
+      gsub(/З/, "з", s)
+      gsub(/И/, "и", s)
+      gsub(/Й/, "й", s)
+      gsub(/К/, "к", s)
+      gsub(/Л/, "л", s)
+      gsub(/М/, "м", s)
+      gsub(/Н/, "н", s)
+      gsub(/О/, "о", s)
+      gsub(/П/, "п", s)
+      gsub(/Р/, "р", s)
+      gsub(/С/, "с", s)
+      gsub(/Т/, "т", s)
+      gsub(/У/, "у", s)
+      gsub(/Ф/, "ф", s)
+      gsub(/Х/, "х", s)
+      gsub(/Ц/, "ц", s)
+      gsub(/Ч/, "ч", s)
+      gsub(/Ш/, "ш", s)
+      gsub(/Щ/, "щ", s)
+      gsub(/Ъ/, "ъ", s)
+      gsub(/Ы/, "ы", s)
+      gsub(/Ь/, "ь", s)
+      gsub(/Э/, "э", s)
+      gsub(/Ю/, "ю", s)
+      gsub(/Я/, "я", s)
+      return s
+    }
+
+    BEGIN {
+      wn = split(ENVIRON["FILTER_WORDS"], W, "\n")
+      chars = ENVIRON["FILTER_CHARS"]
+      for (j = 1; j <= wn; j++) W[j] = lowcase(W[j])
+    }
+    {
+      if ($0 !~ /#/) { print; next }
+      name = $0
+      sub(/^.*#/, "", name)
+      name = lowcase(urldecode(name))
+      drop = 0
+      for (j = 1; j <= wn; j++)
+        if (W[j] != "" && index(name, W[j])) { drop = 1; break }
+      if (!drop) {
+        ln = length(name)
+        for (j = 1; j <= ln; j++)
+          if (index(chars, substr(name, j, 1))) { drop = 1; break }
+      }
+      if (!drop) print
+    }'
+}
+
+BACKUP=/tmp/podkop-sub.podkop.prev
+
+# Remnawave-based panels hide the real list behind a device id: without an
+# x-hwid header they answer with a single "App not supported" placeholder.
+# The id is stored rather than derived on every run - the panel counts distinct
+# ids against the account's device limit, so a changing one would eat it up.
+HWID=
+ensure_hwid() {
+  local mac
+
+  HWID=$(uci -q get "$CONF".main.hwid)
+  [ -n "$HWID" ] && return
+
+  mac=$(cat /sys/class/net/*/address 2>/dev/null \
+    | grep -v '^00:00:00:00:00:00$' | head -1 | tr -d ':')
+  [ -n "$mac" ] || mac=$(head -c 6 /dev/urandom | md5sum | cut -c1-12)
+
+  HWID="$mac"
+  uci set "$CONF".main.hwid="$HWID"
+  uci commit "$CONF"
+  log "Device id generated: $HWID"
+}
+
+cmd_update() {
+  local url target body payload raw links usable skipped count banned
+  local filter_enabled filter_chars
+  local before after applied i reason
+
+  config_load "$CONF"
+  config_get url    main url
+  config_get target main target 'main'
+
+  config_get filter_enabled main filter_enabled '1'
+  config_get filter_chars   main filter_chars   ''
+  FILTER_CHARS="$filter_chars"
+  FILTER_WORDS=''
+  config_list_foreach main filter_words collect_word
+
+  [ -n "$url" ] || { err "Subscription URL is not set"; return 2; }
+
+  if ! uci -q get podkop."$target" >/dev/null; then
+    err "podkop has no section '$target'"
+    return 2
+  fi
+
+  ensure_hwid
+
+  # The User-Agent stays ours on purpose: panels pick the response format by
+  # it, and passing for a known client would get us that client's format
+  # (Happ, for one, is answered with an xray JSON config) instead of a list.
+  log "Fetching $(mask_url "$url")"
+  body=$(curl -fsSL --max-time 30 -A "$UA" -H "x-hwid: $HWID" "$url") || {
+    err "Fetch failed"
+    return 3
+  }
+
+  # Some panels serve the list already decoded
+  case "$body" in
+    *://*) payload="$body" ;;
+    *)     payload=$(printf '%s' "$body" | b64_decode) ;;
+  esac
+
+  raw=$(printf '%s\n' "$payload" \
+    | tr -d '\r' \
+    | grep -E '^(vless|vmess|trojan|ss|hysteria2|socks5?)://' \
+    | awk '!seen[$0]++')
+
+  # A panel that turns us down still answers 200, with one link pointing at
+  # 0.0.0.0. Left in, podkop would happily accept it and route everything into
+  # a dead outbound.
+  links=$(printf '%s\n' "$raw" | grep -v '@0\.0\.0\.0:')
+
+  # podkop builds tcp, ws and grpc transports and nothing else: for the rest it
+  # logs "Unknown transport" and still emits the outbound, just without the
+  # transport - a server that lands in the pool and can never connect. Links
+  # carrying no type at all (ss, hysteria2) are left to podkop to figure out.
+  usable=$(printf '%s\n' "$links" \
+    | awk '!/[?&]type=/ || /[?&]type=(tcp|raw|ws|grpc)([&#]|$)/')
+  skipped=$(( $(nlines "$links") - $(nlines "$usable") ))
+  [ "$skipped" -gt 0 ] && log "Skipped $skipped server(s): transport not supported by podkop"
+  links="$usable"
+
+  # The ban list applies before anything is written: a filtered-out server
+  # never reaches UCI, podkop or the restart below.
+  banned=0
+  if [ "$filter_enabled" = 1 ]; then
+    usable=$(printf '%s\n' "$links" | apply_filter)
+    banned=$(( $(nlines "$links") - $(nlines "$usable") ))
+    [ "$banned" -gt 0 ] && log "Skipped $banned server(s): matched the ban list"
+    links="$usable"
+  fi
+
+  count=$(nlines "$links")
+  if [ "$count" -eq 0 ]; then
+    if printf '%s' "$raw" | grep -q '@0\.0\.0\.0:'; then
+      err "The panel returned a placeholder instead of servers - device rejected"
+    elif [ "$banned" -gt 0 ]; then
+      err "Every server matches the ban list: $banned dropped, none left"
+    elif [ "$skipped" -gt 0 ]; then
+      err "No usable servers: podkop supports tcp, ws and grpc only"
+    else
+      err "No server links found in the subscription"
+    fi
+    return 4
+  fi
+
+  # podkop leaves config.json alone when the generated config comes out the
+  # same, and then the mtime watch below would call a successful no-op a
+  # failure. Nothing to do anyway if the list did not move.
+  if [ "$(config_load podkop; config_list_foreach "$target" urltest_proxy_links echo)" = "$links" ]; then
+    log "Server list unchanged, $count servers"
+    return 0
+  fi
+
+  # The UCI write below lands before podkop gets a chance to reject it, so a
+  # bad subscription would leave a config that only breaks on the next boot.
+  # Copy the whole file rather than saving the two options: link tags may
+  # contain spaces, and a UCI list cannot be split back apart reliably.
+  cp /etc/config/podkop "$BACKUP"
+
+  uci -q delete podkop."$target".urltest_proxy_links
+  printf '%s\n' "$links" | while IFS= read -r link; do
+    [ -n "$link" ] && uci add_list podkop."$target".urltest_proxy_links="$link"
+  done
+  uci set podkop."$target".proxy_config_type='urltest'
+  uci commit podkop
+
+  log "Loaded $count servers into podkop section '$target'"
+
+  # podkop validates the generated sing-box config and keeps the old one if it
+  # fails, so a successful write here does not mean the servers are live.
+  # It rewrites config.json on every successful start - watch its mtime.
+  before=$(date -r /etc/sing-box/config.json +%s 2>/dev/null || echo 0)
+
+  # podkop restarts itself on a config trigger too, but do it explicitly so
+  # the wait below starts from a known point
+  /etc/init.d/podkop restart >/dev/null 2>&1
+
+  i=0
+  after="$before"
+  while [ "$i" -lt 25 ]; do
+    after=$(date -r /etc/sing-box/config.json +%s 2>/dev/null || echo 0)
+    [ "$after" != "$before" ] && break
+    sleep 1
+    i=$((i + 1))
+  done
+
+  if [ "$after" = "$before" ]; then
+    reason=$(logread -e podkop | grep -F '[fatal]' | tail -1 | sed 's/.*\[fatal\] //')
+    err "podkop rejected the new servers: ${reason:-nothing logged}"
+    cp "$BACKUP" /etc/config/podkop
+    /etc/init.d/podkop restart >/dev/null 2>&1
+    err "Previous server list restored"
+    return 5
+  fi
+
+  applied=$(jq -r '[.outbounds[] | select(.type=="urltest") | .outbounds[]] | length' \
+    /etc/sing-box/config.json 2>/dev/null)
+  if [ "$applied" = "$count" ]; then
+    log "podkop applied all $count servers"
+  else
+    err "podkop applied $applied of $count servers"
+    return 6
+  fi
+}
+
+# Fixed schedule on purpose: once a day is enough for a server list, and an
+# interval setting nobody asked for is one more thing to keep working.
+CRON_CMD="/usr/bin/podkop-sub update"
+CRON_LINE="0 5 * * * $CRON_CMD >/dev/null 2>&1"
+
+# Brings root's crontab in line with the config. /etc/init.d/podkop-sub calls
+# this on every change of /etc/config/podkop-sub, so nothing has to be run by
+# hand after ticking the checkbox in LuCI.
+cmd_cron() {
+  local enabled url rest
+
+  config_load "$CONF"
+  config_get_bool enabled main auto_update 1
+  config_get url main url
+
+  # Without a URL the nightly run could only fail. Saving one fires the config
+  # trigger, which lands back here and schedules the job then.
+  [ -n "$url" ] || enabled=0
+  [ "$1" = "off" ] && enabled=0
+
+  rest=$(crontab -l 2>/dev/null | grep -vF "$CRON_CMD")
+
+  {
+    [ -n "$rest" ] && printf '%s\n' "$rest"
+    [ "$enabled" = 1 ] && printf '%s\n' "$CRON_LINE"
+  } | crontab -
+
+  if [ "$enabled" = 1 ]; then
+    log "Daily update scheduled at 05:00 router time"
+    # busybox crond refuses to start while /etc/crontabs is empty, so on a
+    # router that never had a cron job it is not running yet
+    /etc/init.d/cron enable
+    /etc/init.d/cron restart >/dev/null 2>&1
+  else
+    log "Daily update disabled"
+  fi
+}
+
+case "$1" in
+  update) cmd_update ;;
+  cron)   cmd_cron "$2" ;;
+  *)
+    # Deliberately not a <<-EOF heredoc: that form strips only tabs, so a
+    # reindent to spaces silently breaks the script.
+    echo "Usage: $0 update|cron"
+    echo
+    echo "    update    fetch the subscription and rewrite podkop's server list"
+    echo "    cron      sync the scheduled update with the config"
+    exit 1
+    ;;
+esac
